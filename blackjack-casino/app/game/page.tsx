@@ -98,11 +98,13 @@ export default function GamePage() {
   // ─────────────────────────────
   const split = () => {
     if (!canSplit || gameState !== "playing") return;
+    if (activeBet > balance) return;
 
     const newDeck = [...deck];
     const hand1: Card[] = [playerHand[0], newDeck.pop()!];
     const hand2: Card[] = [playerHand[1], newDeck.pop()!];
 
+    setBalance((b) => b - activeBet); // second hand costs another bet
     setPlayerHands([hand1, hand2]);
     setIsSplit(true);
     setActiveHand(0);
@@ -128,7 +130,7 @@ export default function GamePage() {
         return;
       }
       if (isFiveCardCharlie(updated)) {
-        setBalance((b) => b + activeBet * 4); // 3:1 pays back 4x (bet + 3x profit)
+        setBalance((b) => b + activeBet * 4);
         finishRound({ outcome: "fivecard", payout: activeBet * 3 });
       }
       return;
@@ -140,16 +142,17 @@ export default function GamePage() {
     setPlayerHands(hands);
 
     if (isBust(hands[activeHand]) || isFiveCardCharlie(hands[activeHand])) {
-      nextHand();
+      // Pass current hands to avoid stale closure in stand()
+      nextHand(hands);
     }
   };
 
   // ─────────────────────────────
   // NEXT HAND (split)
   // ─────────────────────────────
-  const nextHand = () => {
+  const nextHand = (currentHands?: Card[][]) => {
     if (activeHand >= playerHands.length - 1) {
-      stand();
+      stand(currentHands);
     } else {
       setActiveHand((h) => h + 1);
     }
@@ -177,10 +180,15 @@ export default function GamePage() {
   // ─────────────────────────────
   // STAND
   // ─────────────────────────────
-  const stand = () => {
-    const playerScore = calculateHandValue(playerHand);
+  const stand = (overrideHands?: Card[][]) => {
+    // In split mode, standing on a non-final hand just advances to the next
+    if (isSplit && activeHand < playerHands.length - 1) {
+      setActiveHand((h) => h + 1);
+      return;
+    }
 
-    if (isBust(playerHand)) {
+    // Single-hand bust (hit() already catches it, but guard for doubleDown)
+    if (!isSplit && isBust(playerHand)) {
       finishRound({ outcome: "lost", payout: 0 });
       return;
     }
@@ -191,51 +199,79 @@ export default function GamePage() {
     const result = playDealerTurn(dealerHand, newDeck);
     const dealer = result.hand;
     newDeck = result.deck;
-
     setDealerHand(dealer);
     setDeck(newDeck);
 
     const dealerScore = calculateHandValue(dealer);
-    const playerBJ = isBlackjack(playerHand);
+    const dealerBust = dealerScore > 21;
     const dealerBJ = isBlackjack(dealer);
 
-    // PUSH
-    if (playerScore === dealerScore) {
-      setBalance((b) => b + activeBet);
+    // ── Single hand ──
+    if (!isSplit) {
+      const playerScore = calculateHandValue(playerHand);
+      const playerBJ = isBlackjack(playerHand);
+
+      if (playerBJ && !dealerBJ) {
+        setBalance((b) => b + activeBet * 3);
+        finishRound({ outcome: "blackjack", payout: activeBet * 2 });
+        return;
+      }
+      if (dealerBJ && !playerBJ) {
+        finishRound({ outcome: "lost", payout: 0 });
+        return;
+      }
+      if (playerScore === dealerScore) {
+        setBalance((b) => b + activeBet);
+        finishRound({ outcome: "push", payout: 0 });
+        return;
+      }
+      if (isFiveCardCharlie(playerHand)) {
+        setBalance((b) => b + activeBet * 4);
+        finishRound({ outcome: "fivecard", payout: activeBet * 3 });
+        return;
+      }
+      if (dealerBust) {
+        setBalance((b) => b + activeBet * 2);
+        finishRound({ outcome: "won", payout: activeBet });
+        return;
+      }
+      if (playerScore > dealerScore) {
+        setBalance((b) => b + activeBet * 2);
+        finishRound({ outcome: "won", payout: activeBet });
+      } else {
+        finishRound({ outcome: "lost", payout: 0 });
+      }
+      return;
+    }
+
+    // ── Split hands: evaluate each against the dealer ──
+    // Use overrideHands when called synchronously from hit() to avoid stale state
+    const handsToEval = overrideHands ?? playerHands;
+    const totalWagered = activeBet * handsToEval.length;
+    let totalReturn = 0;
+
+    for (const hand of handsToEval) {
+      if (isBust(hand)) continue; // lost this hand
+
+      const handScore = calculateHandValue(hand);
+
+      if (isFiveCardCharlie(hand)) {
+        totalReturn += activeBet * 4; // 3:1 payout
+      } else if (handScore === dealerScore) {
+        totalReturn += activeBet; // push
+      } else if (dealerBust || handScore > dealerScore) {
+        totalReturn += activeBet * 2; // win
+      }
+      // else lost — no return
+    }
+
+    setBalance((b) => b + totalReturn);
+    const net = totalReturn - totalWagered;
+
+    if (net > 0) {
+      finishRound({ outcome: "won", payout: net });
+    } else if (net === 0) {
       finishRound({ outcome: "push", payout: 0 });
-      return;
-    }
-
-    // BLACKJACK (2:1 per spec → player gets back bet + 2x profit = 3x total)
-    if (playerBJ && !dealerBJ) {
-      setBalance((b) => b + activeBet * 3);
-      finishRound({ outcome: "blackjack", payout: activeBet * 2 });
-      return;
-    }
-
-    if (dealerBJ && !playerBJ) {
-      finishRound({ outcome: "lost", payout: 0 });
-      return;
-    }
-
-    // DEALER BUST
-    if (dealerScore > 21) {
-      setBalance((b) => b + activeBet * 2);
-      finishRound({ outcome: "won", payout: activeBet });
-      return;
-    }
-
-    // FIVE CARD CHARLIE (3:1 per spec)
-    if (isFiveCardCharlie(playerHand)) {
-      setBalance((b) => b + activeBet * 4);
-      finishRound({ outcome: "fivecard", payout: activeBet * 3 });
-      return;
-    }
-
-    // NORMAL WIN / LOSE
-    if (playerScore > dealerScore) {
-      setBalance((b) => b + activeBet * 2);
-      finishRound({ outcome: "won", payout: activeBet });
     } else {
       finishRound({ outcome: "lost", payout: 0 });
     }
@@ -245,106 +281,69 @@ export default function GamePage() {
   // UI
   // ─────────────────────────────
   const handsToRender = isSplit ? playerHands : [playerHand];
+return (
+  <div
+    className="relative w-full h-screen overflow-hidden"
+    style={{ backgroundImage: "url('/BlackJackTable.png')", backgroundSize: "cover", backgroundPosition: "center" }}
+  >
+    {/* DEALER AREA — top center where the two card outlines are */}
+    <div className="absolute top-[6%] left-1/2 -translate-x-1/2 flex gap-3">
+      {dealerHand.map((c, i) => (
+        <CardView key={i} card={c} faceDown={i === 0 && !holeCardRevealed} />
+      ))}
+      <p className="absolute -bottom-6 w-full text-center text-white text-sm">
+        {holeCardRevealed ? `Dealer: ${calculateHandValue(dealerHand)}` : "Dealer: ?"}
+      </p>
+    </div>
 
-  return (
-    <div className="min-h-screen bg-green-800 text-white p-6 flex flex-col gap-6">
-      <h1 className="text-3xl font-bold text-center">Blackjack Table</h1>
-
-      {/* DEALER */}
-      <div className="border-b border-green-600 pb-4">
-        <h2 className="text-xl mb-2">
-          Dealer {holeCardRevealed ? `(${calculateHandValue(dealerHand)})` : "(?)"}
-        </h2>
-        <div className="flex gap-3">
-          {dealerHand.map((c, i) => (
-            <CardView key={i} card={c} faceDown={i === 0 && !holeCardRevealed} />
+    {/* PLAYER AREA — bottom center card outline */}
+    <div className="absolute bottom-[12%] left-1/2 -translate-x-1/2 flex flex-col items-center gap-2">
+      {handsToRender.map((hand, idx) => (
+        <div key={idx} className="flex gap-3">
+          {hand.map((c, i) => (
+            <CardView key={i} card={c} />
           ))}
         </div>
-      </div>
+      ))}
+      <p className="text-white text-sm mt-1">
+        {handsToRender[0]?.length > 0 ? `You: ${calculateHandValue(handsToRender[activeHand] ?? [])}` : ""}
+      </p>
+    </div>
 
-      {/* STATUS */}
-      <div className="text-center text-2xl opacity-80">
-        {gameState.toUpperCase()}
-      </div>
-
-      {/* PLAYER HANDS */}
-      <div className="border-t border-green-600 pt-4 flex flex-col gap-4">
-        {handsToRender.map((hand, idx) => (
-          <div key={idx}>
-            <h2 className="text-lg mb-2">
-              Hand {idx + 1} ({calculateHandValue(hand)})
-              {isSplit && idx === activeHand && (
-                <span className="ml-2 text-yellow-300 text-sm">← Active</span>
-              )}
-            </h2>
-            <div className="flex gap-3">
-              {hand.map((c, i) => (
-                <CardView key={i} card={c} />
-              ))}
-            </div>
-          </div>
+    {/* CHIP / BET AREA — over the center circle */}
+    <div className="absolute bottom-[30%] left-1/2 -translate-x-1/2 flex flex-col items-center gap-2">
+      <p className="text-white font-bold text-lg">Bet: ${gameState === "idle" ? bet : activeBet}</p>
+      <p className="text-white font-semibold">Balance: ${balance}</p>
+      
+      <div className="flex gap-2">
+        {CHIP_VALUES.map((value) => (
+          <button
+            key={value}
+            onClick={() => addChip(value)}
+            disabled={gameState !== "idle"}
+            className="bg-yellow-500 text-black font-bold w-10 h-10 rounded-full text-sm disabled:opacity-40 shadow-lg"
+          >
+            {value}
+          </button>
         ))}
       </div>
+    </div>
 
-      {/* CHIP PANEL */}
-      <div className="text-center space-y-2">
-        <p>Balance: ${balance}</p>
-        <p>Bet: ${gameState === "idle" ? bet : activeBet}</p>
-        <div className="flex gap-2 justify-center flex-wrap">
-          {CHIP_VALUES.map((value) => (
-            <button
-              key={value}
-              onClick={() => addChip(value)}
-              disabled={gameState !== "idle"}
-              className="bg-yellow-500 px-3 py-1 rounded disabled:opacity-40"
-            >
-              +${value}
-            </button>
-          ))}
-        </div>
-        <button onClick={clearChips} className="text-sm underline opacity-70">
-          Clear Chips
-        </button>
-      </div>
+    {/* TOP BAR — balance, back button */}
+    <div className="absolute top-3 left-4 right-4 flex justify-between items-center">
+      <Link href="/" className="text-white text-sm underline opacity-70">← Menu</Link>
+      <p className="text-white font-semibold">Balance: ${balance}</p>
+    </div>
 
-      {/* CONTROLS */}
-      <div className="flex gap-3 justify-center flex-wrap">
-        <button
-          onClick={deal}
-          disabled={gameState !== "idle"}
-          className="bg-blue-500 px-4 py-2 rounded disabled:opacity-40"
-        >
-          Deal
-        </button>
-        <button
-          onClick={hit}
-          disabled={gameState !== "playing" && gameState !== "split"}
-          className="bg-green-500 px-4 py-2 rounded disabled:opacity-40"
-        >
-          Hit
-        </button>
-        <button
-          onClick={stand}
-          disabled={gameState !== "playing" && gameState !== "split"}
-          className="bg-red-500 px-4 py-2 rounded disabled:opacity-40"
-        >
-          Stand
-        </button>
-        <button
-          onClick={doubleDown}
-          disabled={gameState !== "playing" || playerHand.length !== 2}
-          className="bg-yellow-500 px-4 py-2 rounded disabled:opacity-40"
-        >
-          Double Down
-        </button>
-        <button
-          onClick={split}
-          disabled={!canSplit || gameState !== "playing"}
-          className="bg-purple-500 px-4 py-2 rounded disabled:opacity-40"
-        >
-          Split
-        </button>
-      </div>
+    {/* ACTION BUTTONS — bottom strip */}
+    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex gap-2">
+      <button onClick={deal} disabled={gameState !== "idle"} className="bg-blue-600 px-4 py-2 rounded text-white disabled:opacity-40">Deal</button>
+      <button onClick={hit} disabled={gameState !== "playing" && gameState !== "split"} className="bg-green-600 px-4 py-2 rounded text-white disabled:opacity-40">Hit</button>
+      <button onClick={stand} disabled={gameState !== "playing" && gameState !== "split"} className="bg-red-600 px-4 py-2 rounded text-white disabled:opacity-40">Stand</button>
+      <button onClick={doubleDown} disabled={gameState !== "playing" || playerHand.length !== 2} className="bg-yellow-500 px-4 py-2 rounded text-black disabled:opacity-40">Double Down</button>
+      <button onClick={split} disabled={!canSplit || gameState !== "playing"} className="bg-purple-600 px-4 py-2 rounded text-white disabled:opacity-40">Split</button>
+      <button onClick={clearChips} disabled={gameState !== "idle"} className="bg-gray-600 px-4 py-2 rounded text-white disabled:opacity-40">Clear</button>
+    </div>
 
       {/* RESULT OVERLAY */}
       {lastResult && (
